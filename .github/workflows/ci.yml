@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest
+
+      - name: Zero runtime dependencies
+        run: |
+          python - <<'PY'
+          import importlib.metadata as md
+          runtime = [r for r in (md.requires("mcpshape") or []) if "extra ==" not in r]
+          assert not runtime, f"mcpshape must stay stdlib-only, found: {runtime}"
+          print("stdlib-only: OK")
+          PY
+
+      - name: Tests (pinned totals)
+        run: |
+          python -m pytest tests/ -q --junitxml=results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          s = ET.parse("results.xml").getroot()
+          s = s.find("testsuite") if s.tag == "testsuites" else s
+          got = {k: int(s.get(k, 0)) for k in ("tests", "failures", "errors", "skipped")}
+          print(got)
+          # Pinned so a test that silently stops running fails the build.
+          assert got == {"tests": 97, "failures": 0, "errors": 0, "skipped": 0}, got
+          print("pinned totals match")
+          PY
+
+      - name: Two-sided — a valid manifest must be silent
+        run: |
+          set +e
+          python -m mcpshape examples/clean-tools.json > clean.json
+          code=$?
+          set -e
+          test "$code" = "0" || { echo "valid manifest must exit 0, got $code"; exit 1; }
+          echo "valid manifest reports nothing"
+
+      - name: Planted defects each fire their own rule
+        run: |
+          set +e
+          python -m mcpshape examples/broken-tools.json --json > broken.json
+          code=$?
+          set -e
+          test "$code" = "1" || { echo "defects must exit 1, got $code"; exit 1; }
+          python - <<'PY'
+          import json, collections
+          d = json.load(open("broken.json"))
+          rules = collections.Counter(f["rule_id"] for f in d["findings"])
+          for expected in ("name-pattern", "duplicate-tool-name", "required-missing-property",
+                           "empty-enum-or-bad-default", "missing-input-schema",
+                           "additional-properties-open"):
+              assert rules[expected] >= 1, (expected, dict(rules))
+          # Every finding must point at its own evidence.
+          for f in d["findings"]:
+              assert f["json_pointer"].startswith("/tools/"), f
+          print("planted defects ->", dict(rules))
+          PY
+
+      - name: Per-provider tables actually differ (the over-rejection control)
+        run: |
+          python - <<'PY'
+          import json, subprocess, sys
+          def nest(n):
+              s = {"type": "string"}
+              for _ in range(n):
+                  s = {"type": "object", "properties": {"x": s}, "additionalProperties": False}
+              return s
+          def findings(depth, provider):
+              m = {"tools": [{"name": "deep", "description": "d",
+                              "inputSchema": {"type": "object", "properties": {"a": nest(depth)},
+                                              "additionalProperties": False}}]}
+              open("deep.json", "w").write(json.dumps(m))
+              out = subprocess.run([sys.executable, "-m", "mcpshape", "deep.json",
+                                    "--provider", provider, "--json"],
+                                   capture_output=True, text=True).stdout
+              return len(json.loads(out)["findings"])
+          # A schema legal for one provider and illegal for another must be
+          # reported ONLY where it is illegal. If every provider behaved the same,
+          # the per-provider tables would be decoration.
+          shallow = {p: findings(3, p) for p in ("openai", "anthropic", "google")}
+          assert set(shallow.values()) == {0}, shallow
+          mid = {p: findings(6, p) for p in ("openai", "anthropic", "google")}
+          assert mid["anthropic"] == 0, mid
+          assert mid["openai"] >= 1 and mid["google"] >= 1, mid
+          deep = {p: findings(10, p) for p in ("openai", "anthropic", "google")}
+          assert all(v >= 1 for v in deep.values()), deep
+          print("per-provider differs: depth3", shallow, "depth6", mid, "depth10", deep)
+          PY
+
+      - name: An unknown provider is 'unknown', never clean
+        run: |
+          set +e
+          python -m mcpshape examples/clean-tools.json --provider not-a-real-provider --json > unk.json
+          code=$?
+          set -e
+          # The fail-unsafe direction: pointing mcpshape at a provider it does not
+          # know must never let CI go green having checked nothing.
+          test "$code" = "1" || { echo "unknown provider must exit 1, got $code"; exit 1; }
+          python - <<'PY'
+          import json
+          d = json.load(open("unk.json"))
+          assert [f["rule_id"] for f in d["findings"]] == ["unknown-provider"], d
+          print("unknown provider reported unknown, exit 1")
+          PY
+
+      - name: Determinism across processes
+        run: |
+          python - <<'PY'
+          import hashlib, os, subprocess, sys
+          digests = set()
+          for seed in ("0", "1", "42", "1337"):
+              env = dict(os.environ, PYTHONHASHSEED=seed)
+              out = subprocess.run([sys.executable, "-m", "mcpshape",
+                                    "examples/broken-tools.json", "--json"],
+                                   capture_output=True, env=env).stdout
+              digests.add(hashlib.sha256(out).hexdigest())
+          assert len(digests) == 1, f"non-deterministic across hash seeds: {digests}"
+          print("byte-identical across 4 PYTHONHASHSEED values")
+          PY
+
+      - name: Exit-code contract, and it reads stdin
+        run: |
+          set +e
+          printf 'not json at all' > bad.json
+          python -m mcpshape bad.json >/dev/null 2>&1
+          test $? = 2 || { echo "malformed input must exit 2"; exit 1; }
+          cat examples/clean-tools.json | python -m mcpshape >/dev/null 2>&1
+          test $? = 0 || { echo "stdin path must work and exit 0"; exit 1; }
+          set -e
+          echo "exit-code contract holds (0 / 1 / 2), stdin works"

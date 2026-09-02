@@ -1,0 +1,42 @@
+{
+  "tools": [
+    {
+      "name": "bad name with spaces!",
+      "description": "Tool name violates every provider's tool-name pattern.",
+      "inputSchema": {"type": "object", "properties": {"a": {"type": "string"}}}
+    },
+    {
+      "name": "dup",
+      "description": "First tool with this name.",
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "dup",
+      "description": "Second tool with the same name - one silently shadows the other.",
+      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+    },
+    {
+      "name": "missing_req",
+      "description": "required names a property that does not exist.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"a": {"type": "string"}},
+        "required": ["nope"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "bad_default",
+      "description": "default violates the schema it sits in.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {"n": {"type": "integer", "default": "seven"}},
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "no_schema",
+      "description": "No inputSchema at all - a protocol conformance error."
+    }
+  ]
+}
